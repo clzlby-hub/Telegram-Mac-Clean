@@ -262,6 +262,51 @@ def patch_arm64_slice(buf: bytearray, slice_off: int, slice_size: int) -> int:
                             )
                             break
 
+    # -------------------------------------------------------------------------
+    # 5. Bypass macOS Sequoia/Tahoe TCC App Group Container Check (Ad-hoc Sign)
+    #    Redirect containerURLForSecurityApplicationGroupIdentifier: -> homeDirectoryForCurrentUser
+    #    and store app data in ~/Library/TGData instead of ~/Library/Group Containers/...
+    # -------------------------------------------------------------------------
+    sel_needle = b"containerURLForSecurityApplicationGroupIdentifier:\x00"
+    sel_pos = slice_bytes.find(sel_needle)
+    if sel_pos != -1:
+        sel_repl = b"homeDirectoryForCurrentUser\x00".ljust(len(sel_needle), b"\x00")
+        write_at(sel_pos, sel_repl, "Selector redirect -> homeDirectoryForCurrentUser")
+
+    # Find the "NSApplicationCrashOnExceptions" reference in appGroupUrl
+    grp_str = slice_bytes.find(b"NSApplicationCrashOnExceptions\x00")
+    if grp_str != -1:
+        grp_page = grp_str & ~0xFFF
+        grp_pageoff = grp_str & 0xFFF
+        for off in range(0, len(slice_bytes) - 8, 4):
+            i0, i1 = struct.unpack("<II", slice_bytes[off : off + 8])
+            if (i0 & 0x9F000000) == 0x90000000 and (i1 & 0xFFC00000) == 0x91000000:
+                immlo = (i0 >> 29) & 3
+                immhi = (i0 >> 5) & 0x7FFFF
+                imm = sign_extend((immhi << 2) | immlo, 21) << 12
+                if (off & ~0xFFF) + imm == grp_page and ((i1 >> 10) & 0xFFF) == grp_pageoff:
+                    # Find the 1-instruction thunk `b <subfolder_fn>` shortly after appGroupUrl
+                    found_thunk = False
+                    for scan in range(off, off + 0x600, 4):
+                        ins = struct.unpack("<I", slice_bytes[scan : scan + 4])[0]
+                        prev_ins = struct.unpack("<I", slice_bytes[scan - 4 : scan])[0]
+                        if (ins >> 26) == 0b000101 and prev_ins in (0xD65F03C0, 0xD65F0FFF):
+                            imm26 = sign_extend(ins & 0x3FFFFFF, 26)
+                            if 0x100 < imm26 * 4 < 0x2000:
+                                subfolder_fn = (scan + imm26 * 4) & 0xFFFFFFFF
+                                migration_fn = scan + 4
+                                # Return Swift small string "Library/TGData" (14 bytes)
+                                # x0 = 0x2f7972617262694c ("Library/"), x1 = 0xee00617461444754 ("TGData" + 0xee)
+                                subfolder_patch = bytes.fromhex(
+                                    "80298dd2404caef2204ccef220efe5f281ea88d28128acf2812eccf201c0fdf2c0035fd6"
+                                )
+                                write_at(subfolder_fn, subfolder_patch, 'Container subfolder -> "Library/TGData"')
+                                write_at(migration_fn, bytes.fromhex("c0035fd6"), "Skip legacy Group Container migration -> ret")
+                                found_thunk = True
+                                break
+                    if found_thunk:
+                        break
+
     return patched
 
 
@@ -381,6 +426,47 @@ def patch_x86_64_slice(buf: bytearray, slice_off: int, slice_size: int) -> int:
                                 "Settings: Hide Set Emoji Status & Set Profile Color upsell rows",
                             )
                             break
+
+    # -------------------------------------------------------------------------
+    # 5. Bypass macOS Sequoia/Tahoe TCC App Group Container Check (Ad-hoc Sign)
+    #    Redirect containerURLForSecurityApplicationGroupIdentifier: -> homeDirectoryForCurrentUser
+    #    and store app data in ~/Library/TGData instead of ~/Library/Group Containers/...
+    # -------------------------------------------------------------------------
+    sel_needle = b"containerURLForSecurityApplicationGroupIdentifier:\x00"
+    sel_pos = slice_bytes.find(sel_needle)
+    if sel_pos != -1:
+        sel_repl = b"homeDirectoryForCurrentUser\x00".ljust(len(sel_needle), b"\x00")
+        write_at(sel_pos, sel_repl, "Selector redirect -> homeDirectoryForCurrentUser")
+
+    # Find the "6N38VWS5BX.ru.keepcoder.Telegram" reference in appGroupUrl on x86_64
+    grp_str = slice_bytes.find(b"6N38VWS5BX.ru.keepcoder.Telegram\x00")
+    if grp_str != -1:
+        for off in range(0, len(slice_bytes) - 7):
+            if slice_bytes[off : off + 2] == b"\x48\x8d" and (slice_bytes[off + 2] & 0xC7) == 0x05:
+                disp = struct.unpack("<i", slice_bytes[off + 3 : off + 7])[0]
+                if (off + 7 + disp) in (grp_str, grp_str - 0x20):
+                    # Find the thunk `pushq %rbp; movq %rsp, %rbp; popq %rbp; jmp <subfolder_fn>` shortly after appGroupUrl
+                    found_thunk = False
+                    for scan in range(off, off + 0x600):
+                        if slice_bytes[scan : scan + 6] == b"\x55\x48\x89\xe5\x5d\xe9":
+                            rel32 = struct.unpack("<i", slice_bytes[scan + 6 : scan + 10])[0]
+                            if 0x100 < rel32 < 0x2000:
+                                subfolder_fn = (scan + 10 + rel32) & 0xFFFFFFFF
+                                migration_fn = (scan + 0x10) & ~0xF
+                                # movabsq $0x2f7972617262694c, %rax; movabsq $0xee00617461444754, %rdx; retq
+                                subfolder_patch = (
+                                    b"\x48\xb8"
+                                    + struct.pack("<Q", 0x2F7972617262694C)
+                                    + b"\x48\xba"
+                                    + struct.pack("<Q", 0xEE00617461444754)
+                                    + b"\xc3"
+                                )
+                                write_at(subfolder_fn, subfolder_patch, 'Container subfolder -> "Library/TGData"')
+                                write_at(migration_fn, b"\xc3", "Skip legacy Group Container migration -> retq")
+                                found_thunk = True
+                                break
+                    if found_thunk:
+                        break
 
     return patched
 
