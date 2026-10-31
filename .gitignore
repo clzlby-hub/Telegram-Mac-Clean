@@ -1,0 +1,5 @@
+*.dmg
+Telegram.app/
+dmg_root/
+__pycache__/
+.DS_Store

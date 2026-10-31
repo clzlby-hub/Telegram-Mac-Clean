@@ -1,0 +1,58 @@
+name: Auto Build Clean Telegram macOS
+
+on:
+  workflow_dispatch: # 支持在 GitHub Actions 页面手动一键触发
+  schedule:
+    - cron: '0 0 * * 1' # 每周一自动拉取官方最新版并重新打包
+
+permissions:
+  contents: write # 允许自动将 DMG 发布到 GitHub Releases
+
+jobs:
+  build-clean-telegram:
+    runs-on: macos-14
+    steps:
+      - name: 0. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 1. Download Official Native Telegram (Swift)
+        run: |
+          echo "Fetching latest official Telegram for macOS..."
+          curl -fL "https://telegram.org/dl/macos" -o Official.dmg
+          hdiutil attach Official.dmg -nobrowse -mountpoint /Volumes/TG
+          cp -R "/Volumes/TG/Telegram.app" ./Telegram.app
+          hdiutil detach /Volumes/TG
+
+      - name: 2. Binary Patch (Kill Sponsored Ads, Copy Protection & Paid Menus)
+        run: |
+          python3 patch_telegram.py ./Telegram.app/Contents/MacOS/Telegram
+
+      - name: 3. Strip Provisioning Profiles & Re-sign App (Ad-hoc)
+        run: |
+          find ./Telegram.app -name "embedded.provisionprofile" -delete
+          rm -rf ./Telegram.app/Contents/_MASReceipt
+          xattr -cr ./Telegram.app
+          codesign --force --deep --sign - ./Telegram.app
+          codesign --verify --deep --strict ./Telegram.app
+
+      - name: 4. Package into Clean DMG
+        run: |
+          mkdir -p dmg_root
+          cp -R ./Telegram.app dmg_root/
+          ln -s /Applications dmg_root/Applications
+          hdiutil create -volname "Telegram Clean" -srcfolder dmg_root -ov -format UDZO Telegram-Clean-macOS.dmg
+
+      - name: 5. Upload to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-Clean-macOS-DMG
+          path: Telegram-Clean-macOS.dmg
+
+      - name: 6. Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v-latest
+          name: "Telegram Clean macOS (Auto-Updated)"
+          files: Telegram-Clean-macOS.dmg
+          prerelease: false
+          make_latest: true
